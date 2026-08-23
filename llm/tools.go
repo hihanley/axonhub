@@ -7,6 +7,12 @@ import (
 	"strings"
 )
 
+// TransformerMetadataKeyCustomToolNames is the transformer metadata key that carries
+// the names of custom (freeform) tools declared in a request. Chat-style upstreams
+// (e.g. Ollama) report their calls as function calls, so response transformers use
+// this set to restore custom_tool_call items before returning the response.
+const TransformerMetadataKeyCustomToolNames = "custom_tool_names"
+
 // Tool represents a function tool.
 type Tool struct {
 	// Type is the type of the tool.

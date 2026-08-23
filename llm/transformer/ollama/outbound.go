@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 
@@ -161,7 +162,15 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		ollamaReq.Messages = append(ollamaReq.Messages, chatMsg)
 	}
 
+	var customToolNames []string
 	for _, tool := range llmReq.Tools {
+		if tool.Type == llm.ToolTypeResponsesCustomTool {
+			if tool.ResponseCustomTool != nil && tool.ResponseCustomTool.Name != "" {
+				customToolNames = append(customToolNames, tool.ResponseCustomTool.Name)
+			}
+			continue
+		}
+
 		if tool.Type != llm.ToolTypeFunction {
 			continue
 		}
@@ -214,14 +223,20 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 
 	url := base + path
 
-	return &httpclient.Request{
+	outboundReq := &httpclient.Request{
 		Method:    http.MethodPost,
 		URL:       url,
 		Headers:   headers,
 		Body:      body,
 		Auth:      authConfig,
 		APIFormat: string(llm.APIFormatOllamaChat),
-	}, nil
+	}
+	if len(customToolNames) > 0 {
+		outboundReq.TransformerMetadata = map[string]any{
+			llm.TransformerMetadataKeyCustomToolNames: customToolNames,
+		}
+	}
+	return outboundReq, nil
 }
 
 func getContentString(content llm.MessageContent) string {
@@ -372,7 +387,7 @@ func (t *OutboundTransformer) TransformResponse(ctx context.Context, httpResp *h
 		finishReason = "tool_calls"
 	}
 
-	return &llm.Response{
+	resp := &llm.Response{
 		ID:      fmt.Sprintf("ollama-%s", ollamaResp.Model),
 		Object:  "chat.completion",
 		Created: 0,
@@ -396,12 +411,27 @@ func (t *OutboundTransformer) TransformResponse(ctx context.Context, httpResp *h
 			CompletionTokens: ollamaResp.EvalCount,
 			TotalTokens:      ollamaResp.PromptEvalCount + ollamaResp.EvalCount,
 		},
-	}, nil
+	}
+	if httpResp.Request != nil && len(httpResp.Request.TransformerMetadata) > 0 {
+		resp.TransformerMetadata = maps.Clone(httpResp.Request.TransformerMetadata)
+	}
+	return resp, nil
 }
 
 func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+	var metadata map[string]any
+	if req != nil {
+		metadata = req.TransformerMetadata
+	}
 	return streams.MapErr(stream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
-		return t.TransformStreamChunk(ctx, event)
+		resp, err := t.TransformStreamChunk(ctx, event)
+		if err != nil {
+			return nil, err
+		}
+		if resp != nil && len(metadata) > 0 {
+			resp.TransformerMetadata = metadata
+		}
+		return resp, nil
 	}), nil
 }
 

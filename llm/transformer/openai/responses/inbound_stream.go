@@ -375,6 +375,15 @@ func (s *responsesInboundStream) mergeTransformerMetadata(metadata map[string]an
 		mergedCalls := append(existingCalls, calls...)
 		s.transformerMetadata[responsesWebSearchCallsTransformerMetadataKey] = mergedCalls
 	}
+
+	if names, ok := metadata[llm.TransformerMetadataKeyCustomToolNames]; ok {
+		s.transformerMetadata[llm.TransformerMetadataKeyCustomToolNames] = names
+	}
+}
+
+// customToolNames returns the custom (freeform) tool names declared in the request.
+func (s *responsesInboundStream) customToolNames() map[string]struct{} {
+	return customToolNamesFromMetadata(s.transformerMetadata)
 }
 
 func getResponsesReasoningItemMetadata(metadata map[string]any) (responsesReasoningItemMetadata, bool) {
@@ -763,6 +772,19 @@ func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 		},
 	}
 
+	// Chat-style upstreams (e.g. Ollama) report custom tools as function calls;
+	// restore the custom identity so the item is emitted as custom_tool_call and
+	// the streamed arguments are delivered as freeform input.
+	if tc.ResponseCustomToolCall == nil && tc.Function.Name != "" && isCustomTool(tc.Function.Name, s.customToolNames()) {
+		stored := s.toolCalls[toolCallIndex]
+		stored.Type = llm.ToolTypeResponsesCustomTool
+		stored.ResponseCustomToolCall = &llm.ResponseCustomToolCall{
+			CallID: stored.ID,
+			Name:   stored.Function.Name,
+			Input:  "",
+		}
+	}
+
 	// A Responses function_call must include its name in output_item.added for
 	// clients to route it. Some upstreams provide that identity only in a later
 	// arguments delta or done event, so retain the call until it is known.
@@ -848,7 +870,32 @@ func (s *responsesInboundStream) handleFunctionCallDelta(tc llm.ToolCall) error 
 	if tc.Function.Namespace != "" {
 		storedToolCall.Function.Namespace = tc.Function.Namespace
 	}
+
+	// Restore the custom tool identity once the name is known. The raw JSON
+	// arguments keep accumulating in Function.Arguments and are unwrapped when the
+	// tool call closes.
+	if storedToolCall.ResponseCustomToolCall == nil && storedToolCall.Function.Name != "" &&
+		isCustomTool(storedToolCall.Function.Name, s.customToolNames()) {
+		storedToolCall.Type = llm.ToolTypeResponsesCustomTool
+		storedToolCall.ResponseCustomToolCall = &llm.ResponseCustomToolCall{
+			CallID: storedToolCall.ID,
+			Name:   storedToolCall.Function.Name,
+			Input:  "",
+		}
+	}
+
 	storedToolCall.Function.Arguments += tc.Function.Arguments
+
+	if storedToolCall.ResponseCustomToolCall != nil {
+		// Custom tool calls buffer raw JSON fragments and deliver the unwrapped
+		// freeform input when the call closes.
+		if !s.toolCallItemStarted[toolCallIndex] {
+			if err := s.startToolCallItem(toolCallIndex); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	argumentsToEmit := tc.Function.Arguments
 	if !s.toolCallItemStarted[toolCallIndex] {
@@ -1112,8 +1159,18 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 
 		switch {
 		case tc.ResponseCustomToolCall != nil:
-			// Custom tool call - emit custom_tool_call_input.done then output_item.done
+			// Custom tool call - emit custom_tool_call_input.done then output_item.done.
+			// Calls restored from chat-style function calls buffer their raw JSON
+			// arguments in Function.Arguments; unwrap them into freeform input here.
 			fullInput := tc.ResponseCustomToolCall.Input
+			if fullInput == "" && tc.Function.Arguments != "" {
+				if input, ok := freeformInputFromArguments(tc.Function.Arguments); ok {
+					fullInput = input
+				} else {
+					fullInput = tc.Function.Arguments
+				}
+				tc.ResponseCustomToolCall.Input = fullInput
+			}
 
 			err := s.enqueueEvent(&StreamEvent{
 				Type:        StreamEventTypeCustomToolCallInputDone,
