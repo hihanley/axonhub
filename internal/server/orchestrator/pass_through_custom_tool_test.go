@@ -195,3 +195,71 @@ func TestResponsesCustomToolNames(t *testing.T) {
 	require.Equal(t, customToolNames("apply_patch"), responsesCustomToolNames(req))
 	require.Empty(t, responsesCustomToolNames(nil))
 }
+
+func TestRewritePassThroughRequestBodyForOllama(t *testing.T) {
+	body := []byte(`{
+		"model": "qwen3",
+		"tools": [
+			{"type": "custom", "name": "apply_patch", "description": "Apply a patch", "format": {"type": "grammar", "syntax": "lark"}},
+			{"type": "function", "name": "exec_command", "description": "Run a command", "parameters": {"type": "object"}}
+		],
+		"input": [
+			{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix it"}]},
+			{"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"},
+			{"type": "custom_tool_call_output", "call_id": "call_1", "output": "patched"}
+		]
+	}`)
+
+	rewritten, err := rewritePassThroughRequestBodyForOllama(body)
+	require.NoError(t, err)
+	require.NotNil(t, rewritten)
+
+	var payload struct {
+		Input []map[string]any `json:"input"`
+	}
+	require.NoError(t, json.Unmarshal(rewritten, &payload))
+	require.Len(t, payload.Input, 3)
+
+	require.Equal(t, "message", payload.Input[0]["type"])
+
+	call := payload.Input[1]
+	require.Equal(t, "function_call", call["type"])
+	require.Equal(t, "apply_patch", call["name"])
+	require.Equal(t, "call_1", call["call_id"])
+	require.Equal(t, `{"input":"*** Begin Patch\n*** End Patch"}`, call["arguments"])
+	require.NotContains(t, call, "input")
+	require.NotContains(t, call, "custom_tool")
+
+	output := payload.Input[2]
+	require.Equal(t, "function_call_output", output["type"])
+	require.Equal(t, "call_1", output["call_id"])
+	require.Equal(t, "patched", output["output"])
+}
+
+func TestRewritePassThroughRequestBodyForOllamaNoCustomCalls(t *testing.T) {
+	body := []byte(`{"input":[{"type":"message","role":"user","content":"hi"}]}`)
+
+	rewritten, err := rewritePassThroughRequestBodyForOllama(body)
+	require.NoError(t, err)
+	require.Nil(t, rewritten)
+
+	rewritten, err = rewritePassThroughRequestBodyForOllama([]byte(`{"input":"plain text"}`))
+	require.NoError(t, err)
+	require.Nil(t, rewritten)
+}
+
+func TestRewritePassThroughRequestItemCustomToolObjectForm(t *testing.T) {
+	item := map[string]any{
+		"type":        "custom_tool_call",
+		"id":          "ctc_2",
+		"custom_tool": map[string]any{"name": "apply_patch", "description": "Apply a patch"},
+		"arguments":   "*** Begin Patch\n*** End Patch",
+	}
+
+	require.True(t, rewritePassThroughRequestItem(item))
+	require.Equal(t, "function_call", item["type"])
+	require.Equal(t, "apply_patch", item["name"])
+	require.Equal(t, "ctc_2", item["call_id"])
+	require.Equal(t, `{"input":"*** Begin Patch\n*** End Patch"}`, item["arguments"])
+	require.NotContains(t, item, "custom_tool")
+}

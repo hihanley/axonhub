@@ -8,6 +8,7 @@ import (
 
 	"github.com/tidwall/sjson"
 
+	entchannel "github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
@@ -119,6 +120,25 @@ func applyPassThroughRequestBody(outbound *PersistentOutboundTransformer, system
 			)
 
 			return request, nil
+		}
+
+		// Ollama's Responses endpoint accepts custom tool definitions but rejects
+		// custom_tool_call input items. Lower the tool-call history back to
+		// function_call form before replaying the client body upstream.
+		if channel.Type == entchannel.TypeOllama && isResponsesFormat(llmReq.APIFormat) {
+			if rewritten, rewriteErr := rewritePassThroughRequestBodyForOllama(body); rewriteErr != nil {
+				log.Warn(ctx, "failed to rewrite pass-through request for custom tools, keeping original body",
+					log.String("channel", channel.Name),
+					log.Int("channel_id", channel.ID),
+					log.Cause(rewriteErr),
+				)
+			} else if rewritten != nil {
+				body = rewritten
+
+				log.Debug(ctx, "rewrote pass-through request custom tool calls to function calls",
+					log.String("channel", channel.Name),
+				)
+			}
 		}
 
 		request.Body = body

@@ -103,6 +103,108 @@ func freeformInput(arguments string) string {
 	return arguments
 }
 
+// rewritePassThroughRequestBodyForOllama lowers Responses custom tool input items
+// back to the function_call form Ollama's Responses endpoint understands. Ollama
+// accepts custom tool definitions but rejects custom_tool_call input items, so the
+// history Codex sends after executing a custom tool must be rewritten before it
+// reaches the upstream. It returns nil when nothing changed.
+func rewritePassThroughRequestBodyForOllama(body []byte) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("parse pass-through request: %w", err)
+	}
+
+	input, ok := payload["input"].([]any)
+	if !ok {
+		return nil, nil
+	}
+
+	changed := false
+	for _, itemAny := range input {
+		item, ok := itemAny.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if rewritePassThroughRequestItem(item) {
+			changed = true
+		}
+	}
+
+	if !changed {
+		return nil, nil
+	}
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal rewritten pass-through request: %w", err)
+	}
+
+	return rewritten, nil
+}
+
+// rewritePassThroughRequestItem lowers one Responses input item from custom tool
+// form to the function_call form Ollama understands. It reports whether the item
+// changed.
+func rewritePassThroughRequestItem(item map[string]any) bool {
+	switch item["type"] {
+	case "custom_tool_call":
+		input, _ := item["input"].(string)
+		if input == "" {
+			if arguments, ok := item["arguments"].(string); ok {
+				input = arguments
+			}
+		}
+		if input == "" {
+			// Leave unusable items untouched so the upstream reports the real problem.
+			return false
+		}
+
+		name, _ := item["name"].(string)
+		if name == "" {
+			if customTool, ok := item["custom_tool"].(map[string]any); ok {
+				name, _ = customTool["name"].(string)
+			}
+		}
+
+		callID, _ := item["call_id"].(string)
+		if callID == "" {
+			callID, _ = item["id"].(string)
+		}
+
+		item["type"] = "function_call"
+		item["name"] = name
+		item["call_id"] = callID
+		item["arguments"] = functionArgumentsFromFreeform(input)
+		delete(item, "input")
+		delete(item, "custom_tool")
+
+		return true
+
+	case "custom_tool_call_output":
+		item["type"] = "function_call_output"
+		delete(item, "name")
+		delete(item, "input")
+		delete(item, "arguments")
+
+		return true
+
+	default:
+		return false
+	}
+}
+
+// functionArgumentsFromFreeform wraps freeform custom tool input in the single
+// string parameter convention used for OpenAI-compatible function calls.
+func functionArgumentsFromFreeform(input string) string {
+	encoded, err := json.Marshal(map[string]string{"input": input})
+	if err != nil {
+		return `{"input":""}`
+	}
+
+	return string(encoded)
+}
+
 // rewritePassThroughResponseBody rewrites function_call output items back to
 // custom_tool_call when the tool was declared as custom. It returns nil when
 // nothing changed.

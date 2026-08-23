@@ -16,6 +16,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/looplj/axonhub/internal/ent"
+	entchannel "github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
@@ -1381,6 +1382,96 @@ func TestApplyPassThroughBodyPreservesMappedModel(t *testing.T) {
 
 	processed.Body[0] = '['
 	require.Equal(t, `{"model":"my-alias","messages":[{"role":"user","content":"hi"}],"temperature":0.4}`, string(outbound.state.LlmRequest.RawRequest.Body))
+}
+
+func TestApplyPassThroughBodyRewritesCustomToolCallsForOllamaResponses(t *testing.T) {
+	ctx := context.Background()
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "ollama-responses",
+			Type: entchannel.TypeOllama,
+			Settings: &objects.ChannelSettings{
+				PassThroughBody: lo.ToPtr(true),
+			},
+		},
+	}
+
+	inboundBody := []byte(`{"model":"qwen3","tools":[{"type":"custom","name":"apply_patch"}],"input":[{"type":"message","role":"user","content":"hi"},{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":"*** Begin Patch"},{"type":"custom_tool_call_output","call_id":"call_1","output":"ok"}]}`)
+
+	outbound := &PersistentOutboundTransformer{
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest: &llm.Request{
+				Model:     "qwen3",
+				APIFormat: llm.APIFormatOpenAIResponse,
+				RawRequest: &httpclient.Request{
+					APIFormat: string(llm.APIFormatOpenAIResponse),
+					Body:      inboundBody,
+				},
+			},
+		},
+	}
+
+	request := &httpclient.Request{
+		APIFormat: string(llm.APIFormatOpenAIResponse),
+		Body:      []byte(`{"model":"qwen3","input":[{"type":"message","role":"user","content":"hi"}]}`),
+	}
+
+	processed, err := applyPassThroughRequestBody(outbound, nil).OnOutboundRawRequest(ctx, request)
+	require.NoError(t, err)
+	require.True(t, outbound.state.PassThroughApplied)
+
+	var payload struct {
+		Input []map[string]any `json:"input"`
+	}
+	require.NoError(t, json.Unmarshal(processed.Body, &payload))
+	require.Len(t, payload.Input, 3)
+	require.Equal(t, "function_call", payload.Input[1]["type"])
+	require.Equal(t, `{"input":"*** Begin Patch"}`, payload.Input[1]["arguments"])
+	require.Equal(t, "function_call_output", payload.Input[2]["type"])
+}
+
+func TestApplyPassThroughBodyKeepsCustomToolCallsForOpenAIResponses(t *testing.T) {
+	ctx := context.Background()
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   2,
+			Name: "openai-responses",
+			Type: entchannel.TypeOpenai,
+			Settings: &objects.ChannelSettings{
+				PassThroughBody: lo.ToPtr(true),
+			},
+		},
+	}
+
+	inboundBody := []byte(`{"model":"gpt-5.2-codex","tools":[{"type":"custom","name":"apply_patch"}],"input":[{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":"*** Begin Patch"}]}`)
+
+	outbound := &PersistentOutboundTransformer{
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest: &llm.Request{
+				Model:     "gpt-5.2-codex",
+				APIFormat: llm.APIFormatOpenAIResponse,
+				RawRequest: &httpclient.Request{
+					APIFormat: string(llm.APIFormatOpenAIResponse),
+					Body:      inboundBody,
+				},
+			},
+		},
+	}
+
+	request := &httpclient.Request{
+		APIFormat: string(llm.APIFormatOpenAIResponse),
+		Body:      []byte(`{"model":"gpt-5.2-codex"}`),
+	}
+
+	processed, err := applyPassThroughRequestBody(outbound, nil).OnOutboundRawRequest(ctx, request)
+	require.NoError(t, err)
+	require.True(t, outbound.state.PassThroughApplied)
+	require.Equal(t, string(inboundBody), string(processed.Body))
 }
 
 func TestApplyPassThroughRequestHeaders(t *testing.T) {
