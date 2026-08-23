@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"reflect"
 	"strings"
 
@@ -36,7 +35,7 @@ func (t *OutboundTransformer) TransformStream(
 	doneEvent := lo.ToPtr(llm.DoneStreamEvent)
 	streamWithDone := streams.AppendStream(stream, doneEvent)
 
-	return streams.NoNil(newResponsesOutboundStream(streamWithDone, req)), nil
+	return streams.NoNil(newResponsesOutboundStream(streamWithDone)), nil
 }
 
 // responsesOutboundStream wraps a stream and maintains state during processing.
@@ -79,35 +78,20 @@ type outboundStreamState struct {
 	transformerMetadataEmitted bool
 }
 
-func newResponsesOutboundStream(stream streams.Stream[*httpclient.StreamEvent], req *httpclient.Request) *responsesOutboundStream {
-	state := &outboundStreamState{
-		toolCalls:                        make(map[string]*llm.ToolCall),
-		itemToCallID:                     make(map[string]string),
-		toolCallIndex:                    make(map[string]int),
-		pendingReasoningEncryptedContent: make(map[string]*string),
-		transformerMetadata:              make(map[string]any),
-	}
-
-	// Chat-style upstreams report custom tools as function calls; the request-side
-	// metadata tells the inbound stream which names must be restored. Seed it so it
-	// is attached to early stream chunks (e.g. the first tool call event) instead of
-	// only reaching the response transformer at stream completion.
-	if req != nil && req.TransformerMetadata != nil {
-		if names, ok := req.TransformerMetadata[llm.TransformerMetadataKeyCustomToolNames]; ok {
-			state.transformerMetadata[llm.TransformerMetadataKeyCustomToolNames] = names
-		}
-	}
-
+func newResponsesOutboundStream(stream streams.Stream[*httpclient.StreamEvent]) *responsesOutboundStream {
 	return &responsesOutboundStream{
 		stream: stream,
-		state:  state,
+		state: &outboundStreamState{
+			toolCalls:                        make(map[string]*llm.ToolCall),
+			itemToCallID:                     make(map[string]string),
+			toolCallIndex:                    make(map[string]int),
+			pendingReasoningEncryptedContent: make(map[string]*string),
+			transformerMetadata:              make(map[string]any),
+		},
 	}
 }
 
 func (s *responsesOutboundStream) enqueue(resp *llm.Response) {
-	if resp != llm.DoneResponse && len(s.state.transformerMetadata) > 0 && len(resp.TransformerMetadata) == 0 {
-		resp.TransformerMetadata = maps.Clone(s.state.transformerMetadata)
-	}
 	s.eventQueue = append(s.eventQueue, resp)
 }
 

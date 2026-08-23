@@ -982,10 +982,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		// output item for a later tool-result request.
 		resp.Output = append(resp.Output, buildReasoningItems(*message)...)
 
-		// Handle tool calls (function calls and custom tool calls). Chat-style
-		// upstreams (e.g. Ollama) report custom tools as function calls with JSON
-		// object arguments, so restore them to custom tool calls before returning.
-		customToolNames := customToolNamesFromMetadata(chatResp.TransformerMetadata)
+		// Handle tool calls (function calls and custom tool calls)
 		if len(message.ToolCalls) > 0 {
 			for _, toolCall := range message.ToolCalls {
 				if toolCall.ResponseCustomToolCall != nil {
@@ -997,30 +994,17 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 						Input:  lo.ToPtr(toolCall.ResponseCustomToolCall.Input),
 						Status: lo.ToPtr("completed"),
 					})
-					continue
-				}
-
-				if restored, ok := toCustomToolCall(toolCall, customToolNames); ok {
+				} else {
 					resp.Output = append(resp.Output, Item{
-						ID:     restored.ID,
-						Type:   "custom_tool_call",
-						CallID: restored.ResponseCustomToolCall.CallID,
-						Name:   restored.ResponseCustomToolCall.Name,
-						Input:  lo.ToPtr(restored.ResponseCustomToolCall.Input),
-						Status: lo.ToPtr("completed"),
+						ID:        toolCall.ID,
+						Type:      "function_call",
+						CallID:    toolCall.ID,
+						Name:      toolCall.Function.Name,
+						Namespace: toolCall.Function.Namespace,
+						Arguments: toolCall.Function.Arguments,
+						Status:    lo.ToPtr("completed"),
 					})
-					continue
 				}
-
-				resp.Output = append(resp.Output, Item{
-					ID:        toolCall.ID,
-					Type:      "function_call",
-					CallID:    toolCall.ID,
-					Name:      toolCall.Function.Name,
-					Namespace: toolCall.Function.Namespace,
-					Arguments: toolCall.Function.Arguments,
-					Status:    lo.ToPtr("completed"),
-				})
 			}
 		}
 

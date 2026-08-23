@@ -75,28 +75,6 @@ func (p *PersistentOutboundTransformer) isPassThroughEnabled(ctx context.Context
 	return enabled
 }
 
-// hasResponsesCustomTools reports whether the request declares any Responses custom
-// (freeform) tools such as apply_patch. Chat-style upstreams report their calls as
-// function calls, so the raw provider response must not be passed through untouched.
-func hasResponsesCustomTools(req *llm.Request) bool {
-	if req == nil {
-		return false
-	}
-	for _, tool := range req.Tools {
-		if tool.Type == llm.ToolTypeResponsesCustomTool {
-			return true
-		}
-	}
-	return false
-}
-
-// isPassThroughResponseEnabled reports whether the raw provider response can be
-// returned untouched. Requests that declare custom (freeform) tools need the
-// transformed response instead so function calls can be restored to custom tool calls.
-func (p *PersistentOutboundTransformer) isPassThroughResponseEnabled(ctx context.Context, systemService *biz.SystemService) bool {
-	return p.isPassThroughEnabled(ctx, systemService) && !hasResponsesCustomTools(p.state.LlmRequest)
-}
-
 func passThroughStreamAligned(originalStream, effectiveStream *bool) bool {
 	originalEnabled := originalStream != nil && *originalStream
 	effectiveEnabled := effectiveStream != nil && *effectiveStream
@@ -285,7 +263,20 @@ func applyUserAgentPassThrough(outbound *PersistentOutboundTransformer, systemSe
 // captureRawProviderResponse stores the raw provider response on state for response pass-through.
 func captureRawProviderResponse(outbound *PersistentOutboundTransformer, systemService *biz.SystemService) pipeline.Middleware {
 	return pipeline.OnRawResponse("capture-raw-provider-response", func(ctx context.Context, response *httpclient.Response) (*httpclient.Response, error) {
-		if outbound.isPassThroughResponseEnabled(ctx, systemService) {
+		if outbound.isPassThroughEnabled(ctx, systemService) {
+			if names := responsesCustomToolNames(outbound.state.LlmRequest); len(names) > 0 {
+				rewritten, err := rewritePassThroughResponseBody(response.Body, names)
+				if err != nil {
+					log.Warn(ctx, "failed to rewrite pass-through response for custom tools, returning raw response",
+						log.Cause(err))
+				} else if rewritten != nil {
+					cloned := *response
+					cloned.Body = rewritten
+					response = &cloned
+
+					log.Debug(ctx, "rewrote pass-through response function calls to custom tool calls")
+				}
+			}
 			outbound.state.RawProviderResponse = response
 		}
 
@@ -297,10 +288,7 @@ func captureRawProviderResponse(outbound *PersistentOutboundTransformer, systemS
 // when PassThroughBody is enabled and the inbound/outbound API formats match.
 func applyPassThroughResponse(outbound *PersistentOutboundTransformer, systemService *biz.SystemService) pipeline.Middleware {
 	return pipeline.OnInboundRawResponse("pass-through-response", func(ctx context.Context, response *httpclient.Response) (*httpclient.Response, error) {
-		if !outbound.isPassThroughResponseEnabled(ctx, systemService) {
-			if outbound.state.LlmRequest != nil && hasResponsesCustomTools(outbound.state.LlmRequest) {
-				log.Debug(ctx, "skipping response pass-through: request declares custom tools")
-			}
+		if !outbound.isPassThroughEnabled(ctx, systemService) {
 			return response, nil
 		}
 
@@ -324,7 +312,15 @@ func applyPassThroughResponse(outbound *PersistentOutboundTransformer, systemSer
 // raw events are stored on state.RawStreamCh for pass-through delivery.
 func captureRawProviderStream(outbound *PersistentOutboundTransformer, systemService *biz.SystemService) pipeline.Middleware {
 	return pipeline.OnRawStream("capture-raw-provider-stream", func(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*httpclient.StreamEvent], error) {
-		if !outbound.isPassThroughResponseEnabled(ctx, systemService) {
+		enabled := outbound.isPassThroughEnabled(ctx, systemService)
+		var rewriter *customToolStreamRewriter
+		if enabled {
+			if names := responsesCustomToolNames(outbound.state.LlmRequest); len(names) > 0 {
+				rewriter = newCustomToolStreamRewriter(names)
+			}
+		}
+
+		if !enabled {
 			return stream, nil
 		}
 
@@ -401,13 +397,38 @@ func captureRawProviderStream(outbound *PersistentOutboundTransformer, systemSer
 					return
 				}
 
-				select {
-				case rawStreamCh <- event:
-				case <-attemptCtx.Done():
-					log.Debug(ctx, "context canceled while sending pass-through event",
-						log.String("channel", channel.Name))
+				if rewriter != nil {
+					events, err := rewriter.rewrite(event)
+					if err != nil {
+						log.Warn(ctx, "failed to rewrite pass-through stream event for custom tools, forwarding raw event",
+							log.Cause(err))
 
-					return
+						events = []*httpclient.StreamEvent{event}
+					}
+
+					for _, ev := range events {
+						if ev == nil {
+							continue
+						}
+
+						select {
+						case rawStreamCh <- ev:
+						case <-attemptCtx.Done():
+							log.Debug(ctx, "context canceled while sending pass-through event",
+								log.String("channel", channel.Name))
+
+							return
+						}
+					}
+				} else {
+					select {
+					case rawStreamCh <- event:
+					case <-attemptCtx.Done():
+						log.Debug(ctx, "context canceled while sending pass-through event",
+							log.String("channel", channel.Name))
+
+						return
+					}
 				}
 			}
 		}()
@@ -421,10 +442,7 @@ func captureRawProviderStream(outbound *PersistentOutboundTransformer, systemSer
 // performance recording, rate limit tracking) still process events.
 func applyPassThroughStream(outbound *PersistentOutboundTransformer, systemService *biz.SystemService) pipeline.Middleware {
 	return pipeline.OnInboundRawStream("pass-through-response-stream", func(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*httpclient.StreamEvent], error) {
-		if !outbound.isPassThroughResponseEnabled(ctx, systemService) {
-			if outbound.state.LlmRequest != nil && hasResponsesCustomTools(outbound.state.LlmRequest) {
-				log.Debug(ctx, "skipping response stream pass-through: request declares custom tools")
-			}
+		if !outbound.isPassThroughEnabled(ctx, systemService) {
 			return stream, nil
 		}
 
