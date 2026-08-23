@@ -1,7 +1,9 @@
 package responses
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 
 	"github.com/looplj/axonhub/llm"
@@ -55,6 +57,11 @@ func freeformInputFromArguments(raw string) (string, bool) {
 		}
 	}
 
+	// Plain text without any JSON wrapper (not an object or quoted string).
+	if !strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "[") {
+		return raw, true
+	}
+
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(raw), &obj); err != nil || len(obj) == 0 {
 		return "", false
@@ -63,7 +70,7 @@ func freeformInputFromArguments(raw string) (string, bool) {
 	// Prefer the conventional keys used by OpenAI-compatible chat converters.
 	for _, key := range []string{"input", "patch", "content", "text"} {
 		if value, ok := obj[key].(string); ok {
-			return value, true
+			return decodeFreeformString(value), true
 		}
 	}
 
@@ -77,9 +84,22 @@ func freeformInputFromArguments(raw string) (string, bool) {
 		found = text
 	}
 	if found != "" {
-		return found, true
+		return decodeFreeformString(found), true
 	}
 	return "", false
+}
+
+// decodeFreeformString returns value, decoding one extra JSON string layer when the
+// upstream double-encoded the freeform input (e.g. `"\"*** Begin Patch\""`).
+func decodeFreeformString(value string) string {
+	if !strings.HasPrefix(value, `"`) {
+		return value
+	}
+	var decoded string
+	if err := json.Unmarshal([]byte(value), &decoded); err == nil {
+		return decoded
+	}
+	return value
 }
 
 // toCustomToolCall converts a chat-style function call into a custom tool call when
@@ -104,6 +124,9 @@ func toCustomToolCall(tc llm.ToolCall, names map[string]struct{}) (llm.ToolCall,
 		CallID: tc.ID,
 		Name:   name,
 		Input:  input,
+	}
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		slog.DebugContext(context.Background(), "restored custom tool call", slog.String("tool", name))
 	}
 	return tc, true
 }

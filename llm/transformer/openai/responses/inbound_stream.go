@@ -1163,13 +1163,19 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 			// Calls restored from chat-style function calls buffer their raw JSON
 			// arguments in Function.Arguments; unwrap them into freeform input here.
 			fullInput := tc.ResponseCustomToolCall.Input
+			restored := false
 			if fullInput == "" && tc.Function.Arguments != "" {
 				if input, ok := freeformInputFromArguments(tc.Function.Arguments); ok {
 					fullInput = input
+					restored = true
 				} else {
 					fullInput = tc.Function.Arguments
 				}
 				tc.ResponseCustomToolCall.Input = fullInput
+			}
+			if restored && slog.Default().Enabled(s.ctx, slog.LevelDebug) {
+				slog.DebugContext(s.ctx, "restored custom tool call from streamed function call",
+					slog.String("tool", tc.ResponseCustomToolCall.Name))
 			}
 
 			err := s.enqueueEvent(&StreamEvent{

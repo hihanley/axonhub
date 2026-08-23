@@ -13,6 +13,25 @@ import (
 // this set to restore custom_tool_call items before returning the response.
 const TransformerMetadataKeyCustomToolNames = "custom_tool_names"
 
+// CustomToolNames returns the names of Responses custom (freeform) tools declared
+// in req. Chat-style upstreams (e.g. Ollama) report their calls as function calls,
+// so callers attach this set to transformer metadata to restore custom tool calls
+// on the response side.
+func CustomToolNames(req *Request) []string {
+	if req == nil {
+		return nil
+	}
+
+	names := make([]string, 0)
+	for _, tool := range req.Tools {
+		if tool.Type != ToolTypeResponsesCustomTool || tool.ResponseCustomTool == nil || tool.ResponseCustomTool.Name == "" {
+			continue
+		}
+		names = append(names, tool.ResponseCustomTool.Name)
+	}
+	return names
+}
+
 // Tool represents a function tool.
 type Tool struct {
 	// Type is the type of the tool.

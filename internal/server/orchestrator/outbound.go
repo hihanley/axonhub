@@ -402,6 +402,18 @@ func (p *PersistentOutboundTransformer) TransformRequest(ctx context.Context, ll
 	}
 	llmRequest = filterResponseCustomToolMessagesForNonResponsesOutbound(llmRequest, outboundFormat)
 
+	// Carry custom (freeform) tool names with the outbound request so response
+	// transformers can restore chat-style function calls to custom tool calls.
+	// This must be set before the wrapped transformer runs so every outbound
+	// implementation (including the Responses transformer used for pass-through)
+	// can propagate it to the response side.
+	if names := llm.CustomToolNames(llmRequest); len(names) > 0 {
+		if llmRequest.TransformerMetadata == nil {
+			llmRequest.TransformerMetadata = map[string]any{}
+		}
+		llmRequest.TransformerMetadata[llm.TransformerMetadataKeyCustomToolNames] = names
+	}
+
 	if shouldForceStreamingForCandidate(candidate, llmRequest) {
 		streamPtr := lo.ToPtr(true)
 		llmRequest.Stream = streamPtr

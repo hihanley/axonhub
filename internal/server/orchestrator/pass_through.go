@@ -298,6 +298,9 @@ func captureRawProviderResponse(outbound *PersistentOutboundTransformer, systemS
 func applyPassThroughResponse(outbound *PersistentOutboundTransformer, systemService *biz.SystemService) pipeline.Middleware {
 	return pipeline.OnInboundRawResponse("pass-through-response", func(ctx context.Context, response *httpclient.Response) (*httpclient.Response, error) {
 		if !outbound.isPassThroughResponseEnabled(ctx, systemService) {
+			if outbound.state.LlmRequest != nil && hasResponsesCustomTools(outbound.state.LlmRequest) {
+				log.Debug(ctx, "skipping response pass-through: request declares custom tools")
+			}
 			return response, nil
 		}
 
@@ -419,6 +422,9 @@ func captureRawProviderStream(outbound *PersistentOutboundTransformer, systemSer
 func applyPassThroughStream(outbound *PersistentOutboundTransformer, systemService *biz.SystemService) pipeline.Middleware {
 	return pipeline.OnInboundRawStream("pass-through-response-stream", func(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*httpclient.StreamEvent], error) {
 		if !outbound.isPassThroughResponseEnabled(ctx, systemService) {
+			if outbound.state.LlmRequest != nil && hasResponsesCustomTools(outbound.state.LlmRequest) {
+				log.Debug(ctx, "skipping response stream pass-through: request declares custom tools")
+			}
 			return stream, nil
 		}
 
